@@ -3,10 +3,42 @@ from posthog.test.base import APIBaseTest
 from parameterized import parameterized
 
 from posthog.constants import AvailableFeature
+from posthog.models.organization import OrganizationMembership
 from posthog.models.personal_api_key import PersonalAPIKey
 from posthog.models.utils import generate_random_token_personal, hash_key_value
 
 from products.access_control.backend.facade.mcp_access import MCP_USER_AGENT_MARKER
+
+
+class TestMCPAccessSetting(APIBaseTest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ORGANIZATION_SECURITY_SETTINGS,
+                "name": AvailableFeature.ORGANIZATION_SECURITY_SETTINGS,
+            }
+        ]
+        self.organization.save()
+        self.organization_membership.level = OrganizationMembership.Level.ADMIN
+        self.organization_membership.save()
+
+    def test_toggle_round_trip(self) -> None:
+        response = self.client.patch("/api/organizations/@current/", {"mcp_access_read_only": True})
+        assert response.status_code == 200
+        assert response.json()["mcp_access_read_only"] is True
+        self.organization.refresh_from_db()
+        assert self.organization.mcp_access_read_only is True
+
+        response = self.client.patch("/api/organizations/@current/", {"mcp_access_read_only": False})
+        assert response.json()["mcp_access_read_only"] is False
+
+    def test_toggle_requires_the_entitlement(self) -> None:
+        self.organization.available_product_features = []
+        self.organization.save()
+        response = self.client.patch("/api/organizations/@current/", {"mcp_access_read_only": True})
+        assert response.status_code == 400
+        assert response.json()["code"] == "payment_required"
 
 
 class TestMCPReadOnlyEnforcement(APIBaseTest):
