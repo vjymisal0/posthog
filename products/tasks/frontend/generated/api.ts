@@ -34,6 +34,8 @@ import type {
     LoopsTriggerCreateBodyTwo,
     ModelCatalogueResponseApi,
     OnboardingSessionApi,
+    OnboardingSessionTestApi,
+    OnboardingSessionTestResponseApi,
     PaginatedChannelDTOListApi,
     PaginatedChannelFeedMessageDTOListApi,
     PaginatedChannelInstructionsDTOListApi,
@@ -141,6 +143,7 @@ import type {
     TasksSlackThreadContextRetrieveParams,
     TasksSummariesCreateParams,
     TasksThreadMessagesListParams,
+    TeachingCanvasApi,
     WarmTaskRequestApi,
     WarmTaskResponseApi,
     WizardCloudRunDTOApi,
@@ -1133,6 +1136,27 @@ export const taskChannelsOnboardingSessionCreate = async (
     })
 }
 
+export const getTaskChannelsOnboardingSessionTestCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/task_channels/onboarding_session_test/`
+}
+
+/**
+ * Staff-only test path that creates a repeatable session from explicit prompt-building inputs.
+ * @summary Start a test first-run onboarding session
+ */
+export const taskChannelsOnboardingSessionTestCreate = async (
+    projectId: string,
+    onboardingSessionTestApi?: OnboardingSessionTestApi,
+    options?: RequestInit
+): Promise<OnboardingSessionTestResponseApi> => {
+    return apiMutator<OnboardingSessionTestResponseApi>(getTaskChannelsOnboardingSessionTestCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(onboardingSessionTestApi),
+    })
+}
+
 export const getTaskChannelsProvisionDefaultsCreateUrl = (projectId: string) => {
     return `/api/projects/${projectId}/task_channels/provision_defaults/`
 }
@@ -1146,6 +1170,24 @@ export const taskChannelsProvisionDefaultsCreate = async (
     options?: RequestInit
 ): Promise<ProvisionedChannelsApi> => {
     return apiMutator<ProvisionedChannelsApi>(getTaskChannelsProvisionDefaultsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getTaskChannelsTeachingCanvasTestCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/task_channels/teaching_canvas_test/`
+}
+
+/**
+ * Staff-only test path that resolves or creates the teaching canvas in #general.
+ * @summary Create the teaching canvas for testing
+ */
+export const taskChannelsTeachingCanvasTestCreate = async (
+    projectId: string,
+    options?: RequestInit
+): Promise<TeachingCanvasApi> => {
+    return apiMutator<TeachingCanvasApi>(getTaskChannelsTeachingCanvasTestCreateUrl(projectId), {
         ...options,
         method: 'POST',
     })
