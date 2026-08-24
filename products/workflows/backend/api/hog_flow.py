@@ -2016,6 +2016,7 @@ class HogFlowMinimalSerializer(UserAccessControlSerializerMixin, serializers.Mod
             "created_at",
             "created_by",
             "updated_at",
+            "kind",
             "trigger",
             "trigger_masking",
             "conversion",
@@ -2091,6 +2092,16 @@ class HogFlowSerializer(HogFlowMinimalSerializer):
         choices=HogFlow.State.choices,
         required=False,
         help_text="draft (no execution), active (live), archived (disabled).",
+    )
+    kind = serializers.ChoiceField(
+        choices=HogFlow.Kind.choices,
+        required=False,
+        allow_null=True,
+        help_text=(
+            "UX discriminator for workflows built by a purpose-built surface. 'broadcast' marks a one-time or "
+            "scheduled email send (batch trigger + one email action) managed via the broadcasts UI; null for "
+            "ordinary workflows. Doesn't affect execution. Filterable on the list endpoint via ?kind=broadcast."
+        ),
     )
     trigger_masking = HogFlowMaskingSerializer(
         required=False,
@@ -2267,6 +2278,7 @@ class HogFlowSerializer(HogFlowMinimalSerializer):
             "created_at",
             "created_by",
             "updated_at",
+            "kind",
             "trigger",
             "trigger_masking",
             "conversion",
@@ -2875,7 +2887,7 @@ class HogFlowFilterSet(FilterSet):
         model = HogFlow
         # `created_by` is filtered by uuid in safely_get_queryset (the list UI's member picker keys on
         # uuid, not pk), so it's deliberately not an exact-match field here.
-        fields = ["id", "created_at", "updated_at", "status"]
+        fields = ["id", "created_at", "updated_at", "status", "kind"]
 
 
 class HogFlowPagination(LimitOffsetPagination):
