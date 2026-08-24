@@ -59,8 +59,8 @@ export const LargeFleet: Story = {
     ],
 }
 
-// Phone width. Cadence and Next run drop out, and the table stops overflowing sideways, so the
-// name, the status, the run strip, and the on/off toggle all stay on screen.
+// Phone width. Owners, Cadence, and Next run drop out, and the table stops overflowing sideways,
+// so the name, the status, the run strip, and the on/off toggle all stay on screen.
 export const Narrow: Story = {
     parameters: {
         testOptions: { viewport: { width: 375, height: 900 }, waitForLoadersToDisappear: false },
