@@ -14,6 +14,7 @@ import { useServerArchiveSync } from "@posthog/ui/features/archive/useServerArch
 import { useAuthStateValue } from "@posthog/ui/features/auth/store";
 import { UsageButton } from "@posthog/ui/features/billing/UsageButton";
 import { UsageLimitModal } from "@posthog/ui/features/billing/UsageLimitModal";
+import { useSpendGuardrails } from "@posthog/ui/features/billing/useSpendGuardrails";
 import { BlankTabView } from "@posthog/ui/features/browser-tabs/BlankTabView";
 import { BrowserTabStrip } from "@posthog/ui/features/browser-tabs/BrowserTabStrip";
 import { BrowserTabsDndProvider } from "@posthog/ui/features/browser-tabs/BrowserTabsDnd";
@@ -202,6 +203,7 @@ function RootLayout() {
   const queryClient = useQueryClient();
   const reconcilingTaskIds = useRef<Set<string>>(new Set());
   const billingEnabled = useFeatureFlag(BILLING_FLAG);
+  useSpendGuardrails();
   // "PostHog Web" is a channels-world affordance — show it only while the user
   // is actually seeing channels (toggle on, which itself requires the flag).
   const bluebirdEnabled = useFeatureFlag(
