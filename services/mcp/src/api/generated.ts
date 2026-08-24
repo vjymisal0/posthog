@@ -80159,6 +80159,11 @@ export namespace Schemas {
          * @minimum 1
          */
       tokens?: number;
+      /**
+         * Sum of tool-output sizes across the wasted span.
+         * @minimum 1
+         */
+      output_bytes?: number;
     }
 
     export interface TaskArtifact {
