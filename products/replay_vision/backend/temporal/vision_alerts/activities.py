@@ -122,7 +122,9 @@ class _DispatchedAlert:
     evaluation: _AlertEvaluation
     notification_failed: bool
     produce_result: ProduceResult | None = None
-    suppressed_by_quiet_hours: bool = False
+    # Disabled, snoozed, or inside quiet hours at dispatch time: no notification, and the
+    # alert is excluded from the save so a concurrent control-plane change is not clobbered.
+    suppressed: bool = False
 
     @property
     def committed_outcome(self) -> AlertCheckOutcome:
@@ -182,7 +184,7 @@ def _evaluate_batch(inputs: EvaluateAlertBatchInput) -> EvaluateAlertBatchOutput
         dispatched.append(_dispatch_for_alert(evaluation, now))
 
     dispatched = _resolve_notification_deliveries(dispatched)
-    to_save = [d for d in dispatched if not d.suppressed_by_quiet_hours]
+    to_save = [d for d in dispatched if not d.suppressed]
     saved = _save_outcomes(to_save, now)
 
     output = EvaluateAlertBatchOutput()
@@ -260,35 +262,50 @@ def _evaluate_single_alert(alert: VisionAlertConfiguration, now: datetime) -> _A
 
 
 def _dispatch_for_alert(evaluation: _AlertEvaluation, now: datetime) -> _DispatchedAlert:
-    """Phase 2: defer quiet-hours alerts or dispatch their notification.
+    """Phase 2: re-check current state, defer quiet-hours alerts, or dispatch.
 
-    The lock closes before the produce: nothing may hold an alert row lock across
-    Kafka work, or every observation-completion insert against that alert's FK stalls.
+    The evaluation ran on a snapshot from discovery; a user may have disabled or snoozed
+    the alert since. Re-read those fields fresh and suppress instead of paging. Any lock
+    closes before the produce: nothing may hold an alert row lock across Kafka work, or
+    every observation-completion insert against that alert's FK stalls.
     """
-    with transaction.atomic():
-        current_alert = (
-            VisionAlertConfiguration.all_teams.select_for_update(of=("self",))
-            .select_related("team")
-            .get(id=evaluation.alert.id)
-        )
-        try:
-            next_check_at = next_allowed_check_at(
-                now,
-                team_timezone=current_alert.team.timezone,
-                schedule_restriction=current_alert.schedule_restriction,
+    current = (
+        VisionAlertConfiguration.all_teams.filter(id=evaluation.alert.id)
+        .values("enabled", "snooze_until", "schedule_restriction")
+        .first()
+    )
+    if (
+        current is None
+        or not current["enabled"]
+        or (current["snooze_until"] is not None and current["snooze_until"] > now)
+    ):
+        return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed=True)
+
+    if current["schedule_restriction"]:
+        with transaction.atomic():
+            current_alert = (
+                VisionAlertConfiguration.all_teams.select_for_update(of=("self",))
+                .select_related("team")
+                .get(id=evaluation.alert.id)
             )
-        except Exception as e:
-            logger.exception(
-                "vision_alert.invalid_quiet_hours",
-                alert_id=str(current_alert.id),
-                team_id=current_alert.team_id,
-                error=str(e),
-            )
-            return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed_by_quiet_hours=True)
-        if next_check_at > now:
-            current_alert.next_check_at = next_check_at
-            current_alert.save(update_fields=["next_check_at", "updated_at"])
-            return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed_by_quiet_hours=True)
+            try:
+                next_check_at = next_allowed_check_at(
+                    now,
+                    team_timezone=current_alert.team.timezone,
+                    schedule_restriction=current_alert.schedule_restriction,
+                )
+            except Exception as e:
+                logger.exception(
+                    "vision_alert.invalid_quiet_hours",
+                    alert_id=str(current_alert.id),
+                    team_id=current_alert.team_id,
+                    error=str(e),
+                )
+                return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed=True)
+            if next_check_at > now:
+                current_alert.next_check_at = next_check_at
+                current_alert.save(update_fields=["next_check_at", "updated_at"])
+                return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed=True)
 
     produce_result = _dispatch_notification(evaluation, now)
     enqueue_failed = evaluation.outcome.notification != NotificationAction.NONE and produce_result is None
@@ -309,10 +326,14 @@ def _dispatch_notification(evaluation: _AlertEvaluation, now: datetime) -> Produ
         result = _emit_alert_event(alert, "$replay_vision_alert_resolved", evaluation.check_result, now)
         log.info("vision_alert.resolved", enqueued=result is not None)
     elif action == NotificationAction.ERROR:
-        result = _emit_failure_event(alert, "$replay_vision_alert_errored", evaluation.outcome, now)
+        result = _emit_failure_event(
+            alert, "$replay_vision_alert_errored", evaluation.outcome, now, message_key="error_message"
+        )
         log.info("vision_alert.errored", consecutive_failures=evaluation.outcome.consecutive_failures)
     elif action == NotificationAction.BROKEN:
-        result = _emit_failure_event(alert, "$replay_vision_alert_auto_disabled", evaluation.outcome, now)
+        result = _emit_failure_event(
+            alert, "$replay_vision_alert_auto_disabled", evaluation.outcome, now, message_key="last_error_message"
+        )
         log.warning("vision_alert.broken", consecutive_failures=evaluation.outcome.consecutive_failures)
     else:
         raise ValueError(f"Unhandled NotificationAction: {action!r}")
@@ -493,13 +514,17 @@ def _emit_alert_event(
 
 
 def _emit_failure_event(
-    alert: VisionAlertConfiguration, event_name: str, outcome: AlertCheckOutcome, now: datetime
+    alert: VisionAlertConfiguration,
+    event_name: str,
+    outcome: AlertCheckOutcome,
+    now: datetime,
+    *,
+    message_key: str,
 ) -> ProduceResult | None:
-    key = "last_error_message" if event_name == "$replay_vision_alert_auto_disabled" else "error_message"
     properties = {
         **_base_properties(alert, now),
         "consecutive_failures": outcome.consecutive_failures,
-        key: outcome.error_message or "",
+        message_key: outcome.error_message or "",
     }
     return produce_alert_internal_event(
         team_id=alert.team_id, event_name=event_name, properties=properties, timestamp=now

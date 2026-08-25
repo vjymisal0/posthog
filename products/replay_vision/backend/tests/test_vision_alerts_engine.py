@@ -161,6 +161,17 @@ class TestVisionAlertEngine(BaseTest):
         assert output.alerts_fired == 1
         assert produce.call_args.kwargs["properties"]["metric_value"] == 1.5
 
+    def test_alert_disabled_after_discovery_is_suppressed(self) -> None:
+        alert = self._make_alert()
+        self._make_observation()
+        self._make_observation()
+        VisionAlertConfiguration.all_teams.filter(id=alert.id).update(enabled=False)
+        output, produce = self._run_batch(alert)
+        assert output.alerts_checked == 0
+        assert alert.state == VisionAlertState.NOT_FIRING
+        assert alert.last_checked_at is None
+        produce.assert_not_called()
+
     def test_undelivered_notification_rolls_back_state(self) -> None:
         alert = self._make_alert()
         self._make_observation()
