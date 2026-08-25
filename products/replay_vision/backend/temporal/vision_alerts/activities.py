@@ -1,0 +1,546 @@
+"""Activities for the replay vision alert check workflow.
+
+Phase layout copies the Logs alert engine: evaluate (no side effects) -> dispatch
+(produce the notification, buffered) -> resolve deliveries (flush + ack, roll back
+outcomes whose notification never reached the broker) -> save (one transaction).
+"""
+
+import dataclasses
+from datetime import UTC, datetime, timedelta
+from itertools import batched
+from typing import Any
+
+from django.db import IntegrityError, OperationalError, transaction
+from django.db.models import Avg, FloatField, QuerySet
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast
+
+import structlog
+import temporalio
+from pydantic import BaseModel
+
+from posthog.dataclasses import frozen
+from posthog.exceptions_capture import capture_exception
+
+from products.alerts.backend.destinations import (
+    ProduceResult,
+    alert_internal_event_delivered,
+    flush_alert_internal_events,
+    produce_alert_internal_event,
+)
+from products.replay_vision.backend.alert_state_machine import (
+    AlertCheckOutcome,
+    AlertState,
+    CheckResult,
+    NotificationAction,
+    apply_outcome,
+    evaluate_alert_check,
+)
+from products.replay_vision.backend.alert_utils import (
+    advance_next_check_at,
+    compute_shard_offset_seconds,
+    due_alerts_q,
+    next_allowed_check_at,
+)
+from products.replay_vision.backend.models.replay_observation import ObservationStatus, ReplayObservation
+from products.replay_vision.backend.models.vision_alert import (
+    DELIVERED_MATCH_RETENTION_DAYS,
+    EVENT_RETENTION_DAYS,
+    STALE_MATCH_RETENTION_DAYS,
+    VisionAlertConfiguration,
+    VisionAlertDirection,
+    VisionAlertEvent,
+    VisionAlertKind,
+    VisionAlertMatch,
+    VisionAlertMetric,
+)
+from products.replay_vision.backend.temporal.decorators import track_activity
+from products.replay_vision.backend.temporal.vision_actions.synthesis import apply_observation_predicate
+from products.replay_vision.backend.temporal.vision_alerts.constants import (
+    CLEANUP_BATCH_SIZE,
+    MAX_ALERTS_PER_BATCH,
+    NOTIFICATION_FLUSH_TIMEOUT_SECONDS,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+class CheckVisionAlertsInput(BaseModel):
+    pass
+
+
+class CheckVisionAlertsOutput(BaseModel):
+    alerts_checked: int = 0
+    alerts_fired: int = 0
+    alerts_resolved: int = 0
+    alerts_errored: int = 0
+
+
+class DiscoverDueAlertsInput(BaseModel):
+    pass
+
+
+class DiscoverDueAlertsOutput(BaseModel):
+    batches: list[list[str]] = []
+
+
+class EvaluateAlertBatchInput(BaseModel):
+    alert_ids: list[str]
+
+
+class EvaluateAlertBatchOutput(BaseModel):
+    alerts_checked: int = 0
+    alerts_fired: int = 0
+    alerts_resolved: int = 0
+    alerts_errored: int = 0
+
+
+class CleanupAlertHistoryInput(BaseModel):
+    pass
+
+
+@frozen
+class _AlertEvaluation:
+    """Phase 1 output: per-alert state-machine result. No Kafka, no writes yet."""
+
+    alert: VisionAlertConfiguration
+    outcome: AlertCheckOutcome
+    check_result: CheckResult
+    state_before: str
+
+
+@frozen
+class _DispatchedAlert:
+    """Phase 2 output: notification dispatched (buffered), ready for the save.
+
+    `notification_failed` drives state rollback: the committed outcome reverts to the
+    pre-check state so the next cycle re-evaluates and re-tries the notification. The
+    failure counter may heal downward but never advance, so the 0 -> 1 error-notify
+    edge is not silently consumed.
+    """
+
+    evaluation: _AlertEvaluation
+    notification_failed: bool
+    produce_result: ProduceResult | None = None
+    suppressed_by_quiet_hours: bool = False
+
+    @property
+    def committed_outcome(self) -> AlertCheckOutcome:
+        if self.notification_failed:
+            return dataclasses.replace(
+                self.evaluation.outcome,
+                new_state=AlertState(self.evaluation.alert.state),
+                consecutive_failures=min(
+                    self.evaluation.alert.consecutive_failures,
+                    self.evaluation.outcome.consecutive_failures,
+                ),
+            )
+        return self.evaluation.outcome
+
+
+@temporalio.activity.defn
+@track_activity()
+async def discover_due_vision_alerts_activity(inputs: DiscoverDueAlertsInput) -> DiscoverDueAlertsOutput:
+    from posthog.sync import database_sync_to_async
+
+    return await database_sync_to_async(_discover_due, thread_sensitive=False)(inputs)
+
+
+def _discover_due(inputs: DiscoverDueAlertsInput) -> DiscoverDueAlertsOutput:
+    now = datetime.now(UTC)
+    due_ids = list(
+        VisionAlertConfiguration.all_teams.filter(
+            due_alerts_q(now, broken_state=AlertState.BROKEN.value, snoozed_state=AlertState.SNOOZED.value),
+            kind=VisionAlertKind.METRIC,
+        )
+        .order_by("team_id", "id")
+        .values_list("id", flat=True)
+    )
+    batches = [[str(alert_id) for alert_id in chunk] for chunk in batched(due_ids, MAX_ALERTS_PER_BATCH, strict=False)]
+    return DiscoverDueAlertsOutput(batches=batches)
+
+
+@temporalio.activity.defn
+@track_activity()
+async def evaluate_vision_alert_batch_activity(inputs: EvaluateAlertBatchInput) -> EvaluateAlertBatchOutput:
+    from posthog.sync import database_sync_to_async
+
+    return await database_sync_to_async(_evaluate_batch, thread_sensitive=False)(inputs)
+
+
+def _evaluate_batch(inputs: EvaluateAlertBatchInput) -> EvaluateAlertBatchOutput:
+    now = datetime.now(UTC)
+    alerts = list(
+        VisionAlertConfiguration.all_teams.filter(id__in=inputs.alert_ids, kind=VisionAlertKind.METRIC)
+        .select_related("team", "scanner")
+        .order_by("id")
+    )
+
+    dispatched: list[_DispatchedAlert] = []
+    for alert in alerts:
+        evaluation = _evaluate_single_alert(alert, now)
+        dispatched.append(_dispatch_for_alert(evaluation, now))
+
+    dispatched = _resolve_notification_deliveries(dispatched)
+    to_save = [d for d in dispatched if not d.suppressed_by_quiet_hours]
+    saved = _save_outcomes(to_save, now)
+
+    output = EvaluateAlertBatchOutput()
+    for d in saved:
+        output.alerts_checked += 1
+        committed = d.committed_outcome
+        if d.evaluation.outcome.error_message is not None:
+            output.alerts_errored += 1
+        elif not d.notification_failed and committed.notification == NotificationAction.FIRE:
+            output.alerts_fired += 1
+        elif not d.notification_failed and committed.notification == NotificationAction.RESOLVE:
+            output.alerts_resolved += 1
+    return output
+
+
+def _selection_statuses(selection: dict[str, Any]) -> list[str]:
+    return list(selection.get("statuses") or [ObservationStatus.SUCCEEDED.value])
+
+
+def _observation_window_qs(
+    alert: VisionAlertConfiguration, window_start: datetime, window_end: datetime
+) -> QuerySet[ReplayObservation]:
+    selection: dict[str, Any] = alert.selection or {}
+    queryset = ReplayObservation.objects.filter(
+        team_id=alert.team_id,
+        scanner_id=alert.scanner_id,
+        status__in=_selection_statuses(selection),
+        completed_at__gte=window_start,
+        completed_at__lt=window_end,
+    )
+    return apply_observation_predicate(queryset, selection)
+
+
+def _evaluate_single_alert(alert: VisionAlertConfiguration, now: datetime) -> _AlertEvaluation:
+    """Phase 1: run the observation window query, apply the state machine."""
+    window_start = now - timedelta(days=alert.window_days)
+
+    check_result: CheckResult
+    try:
+        queryset = _observation_window_qs(alert, window_start, now)
+        if alert.metric == VisionAlertMetric.AVG_SCORE:
+            # Cast the JSONB score to float and average it; observations without a
+            # score (non-scorers) become NULL and fall out of the average.
+            metric_value = queryset.annotate(
+                _score=Cast(
+                    KeyTextTransform("score", KeyTextTransform("model_output", "scanner_result")),
+                    output_field=FloatField(),
+                )
+            ).aggregate(avg=Avg("_score"))["avg"]
+        else:
+            metric_value = float(queryset.count())
+
+        if metric_value is None:
+            # An empty window has no average; neither direction can breach.
+            check_result = CheckResult(metric_value=None, threshold_breached=False, is_inconclusive=True)
+        else:
+            threshold = float(alert.threshold or 0)
+            if alert.direction == VisionAlertDirection.BELOW:
+                breached = metric_value <= threshold
+            else:
+                breached = metric_value >= threshold
+            check_result = CheckResult(metric_value=metric_value, threshold_breached=breached)
+    except Exception as e:
+        capture_exception(e, {"alert_id": str(alert.id)})
+        logger.warning("vision_alert.check_query_failed", alert_id=str(alert.id), team_id=alert.team_id, error=str(e))
+        check_result = CheckResult(
+            metric_value=None,
+            threshold_breached=False,
+            error_message="The alert check query failed.",
+            is_transient_error=isinstance(e, OperationalError),
+        )
+
+    outcome = evaluate_alert_check(alert.to_snapshot(), check_result, now)
+    return _AlertEvaluation(alert=alert, outcome=outcome, check_result=check_result, state_before=alert.state)
+
+
+def _dispatch_for_alert(evaluation: _AlertEvaluation, now: datetime) -> _DispatchedAlert:
+    """Phase 2: defer quiet-hours alerts or dispatch their notification.
+
+    The lock closes before the produce: nothing may hold an alert row lock across
+    Kafka work, or every observation-completion insert against that alert's FK stalls.
+    """
+    with transaction.atomic():
+        current_alert = (
+            VisionAlertConfiguration.all_teams.select_for_update(of=("self",))
+            .select_related("team")
+            .get(id=evaluation.alert.id)
+        )
+        try:
+            next_check_at = next_allowed_check_at(
+                now,
+                team_timezone=current_alert.team.timezone,
+                schedule_restriction=current_alert.schedule_restriction,
+            )
+        except Exception as e:
+            logger.exception(
+                "vision_alert.invalid_quiet_hours",
+                alert_id=str(current_alert.id),
+                team_id=current_alert.team_id,
+                error=str(e),
+            )
+            return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed_by_quiet_hours=True)
+        if next_check_at > now:
+            current_alert.next_check_at = next_check_at
+            current_alert.save(update_fields=["next_check_at", "updated_at"])
+            return _DispatchedAlert(evaluation=evaluation, notification_failed=False, suppressed_by_quiet_hours=True)
+
+    produce_result = _dispatch_notification(evaluation, now)
+    enqueue_failed = evaluation.outcome.notification != NotificationAction.NONE and produce_result is None
+    return _DispatchedAlert(evaluation=evaluation, notification_failed=enqueue_failed, produce_result=produce_result)
+
+
+def _dispatch_notification(evaluation: _AlertEvaluation, now: datetime) -> ProduceResult | None:
+    action = evaluation.outcome.notification
+    if action == NotificationAction.NONE:
+        return None
+
+    alert = evaluation.alert
+    log = logger.bind(alert_id=str(alert.id), alert_name=alert.name, team_id=alert.team_id)
+    if action == NotificationAction.FIRE:
+        result = _emit_alert_event(alert, "$replay_vision_alert_firing", evaluation.check_result, now)
+        log.info("vision_alert.fired", metric_value=evaluation.check_result.metric_value, enqueued=result is not None)
+    elif action == NotificationAction.RESOLVE:
+        result = _emit_alert_event(alert, "$replay_vision_alert_resolved", evaluation.check_result, now)
+        log.info("vision_alert.resolved", enqueued=result is not None)
+    elif action == NotificationAction.ERROR:
+        result = _emit_failure_event(alert, "$replay_vision_alert_errored", evaluation.outcome, now)
+        log.info("vision_alert.errored", consecutive_failures=evaluation.outcome.consecutive_failures)
+    elif action == NotificationAction.BROKEN:
+        result = _emit_failure_event(alert, "$replay_vision_alert_auto_disabled", evaluation.outcome, now)
+        log.warning("vision_alert.broken", consecutive_failures=evaluation.outcome.consecutive_failures)
+    else:
+        raise ValueError(f"Unhandled NotificationAction: {action!r}")
+    return result
+
+
+def _resolve_notification_deliveries(dispatched: list[_DispatchedAlert]) -> list[_DispatchedAlert]:
+    """Phase 2.5: flush the producer and fold delivery failures into `notification_failed`.
+
+    Flush failures are swallowed: per-result checks classify each alert individually,
+    and a save with rolled-back state beats no save at all.
+    """
+    if all(d.produce_result is None for d in dispatched):
+        return dispatched
+
+    flush_alert_internal_events(NOTIFICATION_FLUSH_TIMEOUT_SECONDS)
+
+    resolved: list[_DispatchedAlert] = []
+    for d in dispatched:
+        if d.produce_result is None:
+            resolved.append(d)
+        elif alert_internal_event_delivered(
+            d.produce_result,
+            team_id=d.evaluation.alert.team_id,
+            alert_id=str(d.evaluation.alert.id),
+            event_name=d.evaluation.outcome.notification.value,
+        ):
+            resolved.append(d)
+        else:
+            resolved.append(dataclasses.replace(d, notification_failed=True))
+    return resolved
+
+
+def _stage_alert_for_save(dispatched: _DispatchedAlert, now: datetime) -> tuple[list[str], VisionAlertEvent]:
+    """Mutate the in-memory alert for bulk_update; return update fields and the CHECK row.
+
+    Unlike Logs, a CHECK event row is written on every check: it is what feeds the
+    N-of-M window (`get_recent_breaches`) and the history chart, and vision volumes
+    make the rows cheap.
+    """
+    evaluation = dispatched.evaluation
+    alert = evaluation.alert
+    committed = dispatched.committed_outcome
+
+    update_fields = apply_outcome(alert, committed)
+    alert.last_checked_at = now
+    # bulk_update does not apply auto_now; stamp updated_at explicitly.
+    alert.updated_at = now
+    next_check_at = advance_next_check_at(
+        alert.next_check_at,
+        alert.check_interval_minutes,
+        now,
+        shard_offset_seconds=compute_shard_offset_seconds(alert.id, alert.check_interval_minutes),
+    )
+    try:
+        alert.next_check_at = next_allowed_check_at(
+            next_check_at,
+            team_timezone=alert.team.timezone,
+            schedule_restriction=alert.schedule_restriction,
+        )
+    except Exception as e:
+        logger.exception(
+            "vision_alert.invalid_quiet_hours_at_save", alert_id=str(alert.id), team_id=alert.team_id, error=str(e)
+        )
+        alert.next_check_at = next_check_at
+    update_fields.extend(["last_checked_at", "next_check_at", "updated_at"])
+
+    if (
+        not dispatched.notification_failed
+        and evaluation.outcome.notification != NotificationAction.NONE
+        and evaluation.outcome.update_last_notified_at
+    ):
+        alert.last_notified_at = now
+        update_fields.append("last_notified_at")
+
+    event = VisionAlertEvent(
+        alert=alert,
+        metric_value=evaluation.check_result.metric_value,
+        threshold_breached=evaluation.check_result.threshold_breached,
+        state_before=evaluation.state_before,
+        state_after=committed.new_state.value,
+        error_message=evaluation.outcome.error_message,
+    )
+    return update_fields, event
+
+
+_UPDATE_FIELDS: list[str] = [
+    "state",
+    "consecutive_failures",
+    "last_checked_at",
+    "next_check_at",
+    "last_notified_at",
+    "updated_at",
+]
+
+
+def _save_outcomes(dispatched: list[_DispatchedAlert], now: datetime) -> list[_DispatchedAlert]:
+    """Phase 3: persist outcomes via one bulk_create + one bulk_update; on
+    IntegrityError, fall back to per-alert saves with the already-staged data so
+    `next_check_at` is not advanced twice."""
+    if not dispatched:
+        return []
+
+    staged: list[tuple[_DispatchedAlert, list[str], VisionAlertEvent]] = []
+    try:
+        with transaction.atomic():
+            current_restrictions = dict(
+                VisionAlertConfiguration.all_teams.select_for_update()
+                .filter(id__in=[d.evaluation.alert.id for d in dispatched])
+                .values_list("id", "schedule_restriction")
+            )
+            for d in dispatched:
+                d.evaluation.alert.schedule_restriction = current_restrictions.get(d.evaluation.alert.id)
+                update_fields, event = _stage_alert_for_save(d, now)
+                staged.append((d, update_fields, event))
+
+            VisionAlertEvent.objects.bulk_create([event for _, _, event in staged])
+            VisionAlertConfiguration.all_teams.bulk_update(
+                [d.evaluation.alert for d, _, _ in staged], fields=_UPDATE_FIELDS
+            )
+        return dispatched
+    except IntegrityError as e:
+        logger.warning("vision_alert.bulk_save_integrity_error", error=str(e), batch_size=len(dispatched))
+        capture_exception(e, {"batch_size": len(dispatched), "fallback": "per_alert"})
+
+    saved: list[_DispatchedAlert] = []
+    for d, update_fields, event in staged:
+        try:
+            with transaction.atomic():
+                event.save()
+                d.evaluation.alert.save(update_fields=update_fields)
+            saved.append(d)
+        except Exception as e:
+            logger.exception("vision_alert.per_alert_save_failed", alert_id=str(d.evaluation.alert.id))
+            capture_exception(e, {"alert_id": str(d.evaluation.alert.id), "phase": "per_alert_fallback"})
+    return saved
+
+
+def _metric_label(alert: VisionAlertConfiguration) -> str:
+    return "average score" if alert.metric == VisionAlertMetric.AVG_SCORE else "matching observations"
+
+
+def _window_label(alert: VisionAlertConfiguration) -> str:
+    return "24 hours" if alert.window_days == 1 else f"{alert.window_days} days"
+
+
+def _direction_label(alert: VisionAlertConfiguration) -> str:
+    return "at or below" if alert.direction == VisionAlertDirection.BELOW else "at or above"
+
+
+def _base_properties(alert: VisionAlertConfiguration, now: datetime) -> dict:
+    return {
+        "alert_id": str(alert.id),
+        "alert_name": alert.name,
+        "team_id": alert.team_id,
+        "scanner_id": str(alert.scanner_id),
+        "scanner_name": alert.scanner.name,
+        "triggered_at": now.isoformat(),
+    }
+
+
+def _emit_alert_event(
+    alert: VisionAlertConfiguration, event_name: str, check_result: CheckResult, now: datetime
+) -> ProduceResult | None:
+    properties = {
+        **_base_properties(alert, now),
+        "metric": alert.metric,
+        "metric_label": _metric_label(alert),
+        "metric_value": check_result.metric_value,
+        "threshold": alert.threshold,
+        "direction": _direction_label(alert),
+        "window_days": alert.window_days,
+        "window_label": _window_label(alert),
+    }
+    return produce_alert_internal_event(
+        team_id=alert.team_id, event_name=event_name, properties=properties, timestamp=now
+    )
+
+
+def _emit_failure_event(
+    alert: VisionAlertConfiguration, event_name: str, outcome: AlertCheckOutcome, now: datetime
+) -> ProduceResult | None:
+    key = "last_error_message" if event_name == "$replay_vision_alert_auto_disabled" else "error_message"
+    properties = {
+        **_base_properties(alert, now),
+        "consecutive_failures": outcome.consecutive_failures,
+        key: outcome.error_message or "",
+    }
+    return produce_alert_internal_event(
+        team_id=alert.team_id, event_name=event_name, properties=properties, timestamp=now
+    )
+
+
+@temporalio.activity.defn
+@track_activity()
+async def cleanup_vision_alert_history_activity(inputs: CleanupAlertHistoryInput) -> int:
+    from posthog.sync import database_sync_to_async
+
+    return await database_sync_to_async(_cleanup_history, thread_sensitive=False)(inputs)
+
+
+def _cleanup_history(inputs: CleanupAlertHistoryInput) -> int:
+    """Bounded retention sweep, one small batch per tick: old check-history rows,
+    delivered outbox rows past retention, and stale undelivered outbox rows
+    (alerts disabled or deleted between insert and drain)."""
+    now = datetime.now(UTC)
+    deleted = 0
+
+    event_ids = list(
+        VisionAlertEvent.objects.filter(created_at__lt=now - timedelta(days=EVENT_RETENTION_DAYS)).values_list(
+            "id", flat=True
+        )[:CLEANUP_BATCH_SIZE]
+    )
+    if event_ids:
+        deleted += VisionAlertEvent.objects.filter(id__in=event_ids).delete()[0]
+
+    delivered_ids = list(
+        VisionAlertMatch.all_teams.filter(
+            delivered_at__lt=now - timedelta(days=DELIVERED_MATCH_RETENTION_DAYS)
+        ).values_list("id", flat=True)[:CLEANUP_BATCH_SIZE]
+    )
+    stale_ids = list(
+        VisionAlertMatch.all_teams.filter(
+            delivered_at__isnull=True, created_at__lt=now - timedelta(days=STALE_MATCH_RETENTION_DAYS)
+        ).values_list("id", flat=True)[:CLEANUP_BATCH_SIZE]
+    )
+    match_ids = delivered_ids + stale_ids
+    if match_ids:
+        deleted += VisionAlertMatch.all_teams.filter(id__in=match_ids).delete()[0]
+
+    return deleted
