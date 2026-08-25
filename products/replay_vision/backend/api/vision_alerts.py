@@ -7,14 +7,15 @@ from django.db.models import F, Q, QuerySet
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_field
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 
 from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.api.scoped_related_fields import TeamScopedPrimaryKeyRelatedField
 from posthog.api.shared import UserBasicSerializer
 from posthog.event_usage import report_user_action
 from posthog.models.team.team import Team
@@ -22,6 +23,7 @@ from posthog.models.team.team import Team
 from products.alerts.backend.facade.api import (
     AlertDestinationData,
     AlertDestinationValidationError,
+    AlertScheduleRestriction,
     DestinationType,
     build_alert_destination_config,
     create_alert_destination_hog_functions,
@@ -61,6 +63,7 @@ from products.replay_vision.backend.models.vision_alert import (
     VisionAlertKind,
     VisionAlertMetric,
     VisionAlertState,
+    selection_has_predicate,
 )
 
 MAX_ALERTS_PER_TEAM = 20
@@ -73,7 +76,6 @@ _SENTINEL: Final = object()
 
 # Selection statuses a predicate-carrying alert may target: verdict/tags/score predicates
 # read scanner_result, which failed observations never have.
-_PREDICATE_SELECTION_KEYS = ("verdict", "tags", "min_score", "max_score")
 _SELECTABLE_STATUSES = (ObservationStatus.SUCCEEDED, ObservationStatus.FAILED)
 
 
@@ -81,6 +83,7 @@ def _any_field_changed(instance: VisionAlertConfiguration, validated_data: dict,
     return any(f in validated_data and validated_data[f] != getattr(instance, f) for f in fields)
 
 
+@extend_schema_field(AlertScheduleRestriction)  # type: ignore[arg-type]
 class ScheduleRestrictionField(serializers.JSONField):
     pass
 
@@ -89,7 +92,7 @@ class VisionAlertSelectionSerializer(serializers.Serializer):
     verdict = serializers.ListField(
         child=serializers.CharField(),
         required=False,
-        help_text="Monitor verdicts to match, e.g. ['fail']. Requires succeeded-only statuses.",
+        help_text="Monitor verdicts to match, e.g. ['yes']. Requires succeeded-only statuses.",
     )
     tags = serializers.ListField(
         child=serializers.CharField(),
@@ -112,7 +115,7 @@ class VisionAlertSelectionSerializer(serializers.Serializer):
 
     def validate(self, attrs: dict) -> dict:
         statuses = attrs.get("statuses") or [ObservationStatus.SUCCEEDED.value]
-        has_predicate = any(attrs.get(key) not in (None, []) for key in _PREDICATE_SELECTION_KEYS)
+        has_predicate = selection_has_predicate(attrs)
         if has_predicate and statuses != [ObservationStatus.SUCCEEDED.value]:
             raise ValidationError(
                 "verdict, tags and score filters read scanner results, which only succeeded "
@@ -123,9 +126,9 @@ class VisionAlertSelectionSerializer(serializers.Serializer):
 
 class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
     id = serializers.UUIDField(read_only=True, help_text="Unique identifier for this alert.")
-    scanner_id = serializers.PrimaryKeyRelatedField(
+    scanner_id = TeamScopedPrimaryKeyRelatedField(
         source="scanner",
-        queryset=ReplayScanner.objects.none(),
+        queryset=ReplayScanner.objects.all(),
         help_text="Scanner whose observations this alert watches. Immutable after creation.",
     )
     name = serializers.CharField(
@@ -253,24 +256,9 @@ class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
             "created_by",
             "updated_at",
         ]
-        read_only_fields = [
-            "id",
-            "state",
-            "next_check_at",
-            "last_notified_at",
-            "last_checked_at",
-            "consecutive_failures",
-            "first_enabled_at",
-            "created_at",
-            "created_by",
-            "updated_at",
-        ]
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        team_id = self.context.get("team_id")
-        if team_id is not None:
-            self.fields["scanner_id"].queryset = ReplayScanner.objects.filter(team_id=team_id)  # type: ignore[attr-defined]
+    def validate_name(self, value: str) -> str:
+        return value.strip() or "Untitled alert"
 
     def validate(self, attrs: dict) -> dict:
         instance = self.instance
@@ -281,6 +269,13 @@ class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
                 raise ValidationError({"kind": "Cannot change the kind of an existing alert."})
             if "scanner" in attrs and attrs["scanner"].id != instance.scanner_id:
                 raise ValidationError({"scanner_id": "Cannot move an alert to a different scanner."})
+
+        view = self.context.get("view")
+        scanner_for_access = attrs.get("scanner") if instance is None else getattr(instance, "scanner", None)
+        if view is not None and scanner_for_access is not None:
+            # Alerts inherit access from their scanner; a per-scanner grant must gate them.
+            if not view.user_access_control.check_access_level_for_object(scanner_for_access, "editor"):
+                raise PermissionDenied("You don't have access to this scanner.")
 
         if kind == VisionAlertKind.METRIC:
             threshold = attrs.get("threshold", getattr(instance, "threshold", None))
@@ -318,9 +313,6 @@ class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
         return attrs
 
     def update(self, instance: VisionAlertConfiguration, validated_data: dict) -> VisionAlertConfiguration:
-        if "name" in validated_data and not validated_data.get("name", "").strip():
-            validated_data["name"] = "Untitled alert"
-
         snooze_data = validated_data.pop("snooze_until", _SENTINEL)
 
         threshold_fields = {
@@ -349,16 +341,25 @@ class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
             snapshot = instance.to_snapshot()
             if enabled_change is True:
                 if instance.first_enabled_at is None:
-                    instance.first_enabled_at = timezone.now()
-                    validated_data.setdefault("first_enabled_at", instance.first_enabled_at)
+                    validated_data.setdefault("first_enabled_at", timezone.now())
                 apply_outcome(instance, apply_enable(snapshot), kind=VisionAlertEvent.Kind.ENABLE)
             elif enabled_change is False:
                 apply_outcome(instance, apply_disable(snapshot), kind=VisionAlertEvent.Kind.DISABLE)
             elif snooze_data is not _SENTINEL:
-                if snooze_data is None:
-                    apply_outcome(instance, apply_unsnooze(snapshot), kind=VisionAlertEvent.Kind.UNSNOOZE)
+                snooze_kind = VisionAlertEvent.Kind.UNSNOOZE if snooze_data is None else VisionAlertEvent.Kind.SNOOZE
+                if instance.kind == VisionAlertKind.MATCH:
+                    # Match alerts are stateless (DB-enforced); the drain honors snooze_until directly.
+                    VisionAlertEvent.objects.create(
+                        alert=instance,
+                        kind=snooze_kind,
+                        threshold_breached=False,
+                        state_before=instance.state,
+                        state_after=instance.state,
+                    )
+                elif snooze_data is None:
+                    apply_outcome(instance, apply_unsnooze(snapshot), kind=snooze_kind)
                 else:
-                    apply_outcome(instance, apply_snooze(snapshot), kind=VisionAlertEvent.Kind.SNOOZE)
+                    apply_outcome(instance, apply_snooze(snapshot), kind=snooze_kind)
             elif threshold_changed:
                 apply_outcome(instance, apply_threshold_change(snapshot), kind=VisionAlertEvent.Kind.THRESHOLD_CHANGE)
 
@@ -386,9 +387,6 @@ class VisionAlertConfigurationSerializer(serializers.ModelSerializer):
     def create(self, validated_data: dict) -> VisionAlertConfiguration:
         validated_data["team_id"] = self.context["team_id"]
         validated_data["created_by"] = self.context["request"].user
-
-        if not validated_data.get("name", "").strip():
-            validated_data["name"] = "Untitled alert"
 
         if validated_data.get("enabled", True):
             validated_data["first_enabled_at"] = timezone.now()
@@ -478,10 +476,36 @@ class VisionAlertDestinationResponseSerializer(serializers.Serializer):
 
 class VisionAlertViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
     scope_object = "vision_alert"
+    scope_object_read_actions = ["list", "retrieve", "events"]
+    scope_object_write_actions = [
+        "create",
+        "update",
+        "partial_update",
+        "destroy",
+        "create_destination",
+        "delete_destination",
+        "reset",
+    ]
     # `objects` is fail-closed; `safely_get_queryset` re-scopes to the request team.
     queryset = VisionAlertConfiguration.objects.unscoped().order_by("-created_at")
     serializer_class = VisionAlertConfigurationSerializer
     lookup_field = "id"
+
+    # Configuring an alert or its destinations routes recording-derived content off-platform,
+    # so it needs the same session-recording read gate as vision actions.
+    _CONFIG_ACTIONS = {"create", "update", "partial_update", "create_destination"}
+
+    def dangerously_get_required_scopes(self, request: Request, view: Any) -> list[str] | None:
+        if self.action in self._CONFIG_ACTIONS:
+            return ["vision_alert:write", "session_recording:read"]
+        return None
+
+    def initial(self, request: Request, *args: Any, **kwargs: Any) -> None:
+        super().initial(request, *args, **kwargs)
+        if self.action in self._CONFIG_ACTIONS and not self.user_access_control.check_access_level_for_resource(
+            "session_recording", required_level="viewer"
+        ):
+            raise PermissionDenied("Configuring a Replay Vision alert requires session_recording read access.")
 
     def safely_get_queryset(self, queryset: QuerySet) -> QuerySet:
         if self.action == "list":
@@ -490,6 +514,12 @@ class VisionAlertViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
             scanner_id = query_serializer.validated_data.get("scanner_id")
             if scanner_id:
                 queryset = queryset.filter(scanner_id=scanner_id)
+            # Alerts carry no object-level rows of their own; a scanner-level restriction
+            # must hide that scanner's alerts from the list.
+            accessible_scanners = self.user_access_control.filter_queryset_by_access_level(
+                ReplayScanner.objects.filter(team_id=self.team_id)
+            )
+            queryset = queryset.filter(scanner_id__in=accessible_scanners.values_list("id", flat=True))
         return queryset.filter(team_id=self.team_id).select_related("created_by", "scanner")
 
     def _get_locked_alert(self) -> VisionAlertConfiguration:
@@ -619,12 +649,12 @@ class VisionAlertViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
     )
     @action(detail=True, methods=["POST"], url_path="reset", required_scopes=["vision_alert:write"])
     def reset(self, request: Request, *args: object, **kwargs: object) -> Response:
-        alert = self.get_object()
-        try:
-            outcome = apply_user_reset(alert.to_snapshot())
-        except InvalidTransition:
-            raise ValidationError({"state": "Only broken alerts can be reset."})
         with transaction.atomic():
+            alert = self._get_locked_alert()
+            try:
+                outcome = apply_user_reset(alert.to_snapshot())
+            except InvalidTransition:
+                raise ValidationError({"state": "Only broken alerts can be reset."})
             update_fields = apply_outcome(alert, outcome, kind=VisionAlertEvent.Kind.RESET)
             update_fields.extend(alert.clear_next_check())
             alert.save(update_fields=update_fields)

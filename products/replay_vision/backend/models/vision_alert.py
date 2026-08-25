@@ -1,4 +1,3 @@
-from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from django.core.exceptions import ValidationError
@@ -11,6 +10,8 @@ if TYPE_CHECKING:
     from products.replay_vision.backend.alert_state_machine import AlertSnapshot
 
 ALERT_WINDOW_DAYS = (1, 3, 7, 14, 30)
+# Selection keys that read scanner_result; failed observations never have one.
+PREDICATE_SELECTION_KEYS = ("verdict", "tags", "min_score", "max_score")
 DEFAULT_ALERT_WINDOW_DAYS = 1
 MIN_CHECK_INTERVAL_MINUTES = 15
 DEFAULT_CHECK_INTERVAL_MINUTES = 60
@@ -127,8 +128,12 @@ class VisionAlertConfiguration(TeamScopedRootMixin, UUIDModel):
             ),
         ]
         indexes = [
-            # Scheduler due scan (metric kind).
-            models.Index(fields=["team", "next_check_at", "enabled"], name="vision_alert_scheduler_idx"),
+            # Scheduler due scan is fleet-wide, so the index must not lead with team.
+            models.Index(
+                fields=["next_check_at"],
+                name="vision_alert_scheduler_idx",
+                condition=models.Q(enabled=True, kind="metric"),
+            ),
             # Observation-completion hook lookup (match kind).
             models.Index(fields=["team", "scanner", "kind", "enabled"], name="vision_alert_hook_idx"),
         ]
@@ -139,10 +144,6 @@ class VisionAlertConfiguration(TeamScopedRootMixin, UUIDModel):
     def clean(self) -> None:
         if self.datapoints_to_alarm > self.evaluation_periods:
             raise ValidationError({"datapoints_to_alarm": "Cannot exceed evaluation periods."})
-        if self.window_days not in ALERT_WINDOW_DAYS:
-            raise ValidationError({"window_days": f"Must be one of {ALERT_WINDOW_DAYS}."})
-        if self.check_interval_minutes < MIN_CHECK_INTERVAL_MINUTES:
-            raise ValidationError({"check_interval_minutes": f"Must be at least {MIN_CHECK_INTERVAL_MINUTES}."})
 
     def clear_next_check(self) -> list[str]:
         """Nulls `next_check_at` so the scheduler picks this alert up on the next tick."""
@@ -202,13 +203,9 @@ class VisionAlertEvent(UUIDModel):
     class Meta:
         indexes = [
             models.Index(fields=["alert", "-created_at"], name="vision_alert_evt_alert_ts_idx"),
+            # The retention sweep filters on created_at alone.
+            models.Index(fields=["created_at"], name="vision_alert_evt_created_idx"),
         ]
-
-    @classmethod
-    def clean_up_old_events(cls) -> int:
-        cutoff = datetime.now(UTC) - timedelta(days=EVENT_RETENTION_DAYS)
-        deleted, _ = cls.objects.filter(created_at__lt=cutoff).delete()
-        return deleted
 
 
 class VisionAlertMatch(TeamScopedRootMixin, UUIDModel):
@@ -240,3 +237,12 @@ class VisionAlertMatch(TeamScopedRootMixin, UUIDModel):
             ),
             models.Index(fields=["delivered_at"], name="vision_alert_match_cleanup_idx"),
         ]
+
+
+def selection_statuses(selection: dict) -> list[str]:
+    return list(selection.get("statuses") or ["succeeded"])
+
+
+def selection_has_predicate(selection: dict) -> bool:
+    """0 is a valid score bound, so this must not use bare truthiness."""
+    return any(selection.get(key) not in (None, []) for key in PREDICATE_SELECTION_KEYS)

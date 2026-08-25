@@ -176,6 +176,15 @@ class TestVisionAlertControlPlane(_VisionAlertAPITestCase):
         assert unsnoozed["state"] == "not_firing"
         assert unsnoozed["snooze_until"] is None
 
+    def test_snoozing_a_match_alert_keeps_it_stateless(self) -> None:
+        data = self._create_via_api(self._match_payload())
+        until = (datetime.now(UTC) + timedelta(hours=4)).isoformat()
+        snoozed = self._patch(data["id"], {"snooze_until": until})
+        assert snoozed["state"] == "not_firing"
+        assert snoozed["snooze_until"] is not None
+        unsnoozed = self._patch(data["id"], {"snooze_until": None})
+        assert unsnoozed["snooze_until"] is None
+
     def test_threshold_change_resets_state_and_recheck(self) -> None:
         data = self._create_via_api()
         alert = VisionAlertConfiguration.objects.for_team(self.team.id).get(id=data["id"])

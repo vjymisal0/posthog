@@ -533,7 +533,7 @@ export const StatusesEnumApi = {
 } as const
 
 export interface VisionAlertSelectionApi {
-    /** Monitor verdicts to match, e.g. ['fail']. Requires succeeded-only statuses. */
+    /** Monitor verdicts to match, e.g. ['yes']. Requires succeeded-only statuses. */
     verdict?: string[]
     /** Classifier tags to match; an observation matches when it carries any of them. Requires succeeded-only statuses. */
     tags?: string[]
@@ -576,6 +576,18 @@ export const LogsAlertConfigurationStateEnumApi = {
     Snoozed: 'snoozed',
     Broken: 'broken',
 } as const
+
+export interface AlertScheduleRestrictionWindowApi {
+    /** Start time HH:MM (24-hour, project timezone). Inclusive. Each window must span ≥ 30 minutes on the local daily timeline (half-open [start, end)). */
+    start: string
+    /** End time HH:MM (24-hour). Exclusive (half-open interval). Each window must span ≥ 30 minutes locally. */
+    end: string
+}
+
+export interface AlertScheduleRestrictionApi {
+    /** Blocked local time windows when the alert must not run. Overlapping or identical windows are merged when saved. At most five windows before normalization; empty array clears quiet hours. */
+    blocked_windows: AlertScheduleRestrictionWindowApi[]
+}
 
 export interface VisionAlertConfigurationApi {
     /** Unique identifier for this alert. */
@@ -645,7 +657,7 @@ export interface VisionAlertConfigurationApi {
      */
     cooldown_minutes?: number
     /** Blocked local time windows when the alert must not notify. Times use the project timezone. Null disables quiet hours. */
-    schedule_restriction?: unknown
+    schedule_restriction?: AlertScheduleRestrictionApi | null
     /**
      * ISO 8601 timestamp until which the alert is snoozed. Set to null to unsnooze.
      * @nullable
@@ -760,7 +772,7 @@ export interface PatchedVisionAlertConfigurationApi {
      */
     cooldown_minutes?: number
     /** Blocked local time windows when the alert must not notify. Times use the project timezone. Null disables quiet hours. */
-    schedule_restriction?: unknown
+    schedule_restriction?: AlertScheduleRestrictionApi | null
     /**
      * ISO 8601 timestamp until which the alert is snoozed. Set to null to unsnooze.
      * @nullable

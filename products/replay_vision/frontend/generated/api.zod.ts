@@ -423,7 +423,7 @@ export const VisionAlertsCreateBody = /* @__PURE__ */ zod.object({
             verdict: zod
                 .array(zod.string())
                 .optional()
-                .describe("Monitor verdicts to match, e.g. ['fail']. Requires succeeded-only statuses."),
+                .describe("Monitor verdicts to match, e.g. ['yes']. Requires succeeded-only statuses."),
             tags: zod
                 .array(zod.string())
                 .optional()
@@ -494,7 +494,29 @@ export const VisionAlertsCreateBody = /* @__PURE__ */ zod.object({
         .default(visionAlertsCreateBodyCooldownMinutesDefault)
         .describe('Metric alerts only: minimum minutes between repeated notifications. 0 means no cooldown.'),
     schedule_restriction: zod
-        .unknown()
+        .union([
+            zod.object({
+                blocked_windows: zod
+                    .array(
+                        zod.object({
+                            start: zod
+                                .string()
+                                .describe(
+                                    'Start time HH:MM (24-hour, project timezone). Inclusive. Each window must span ≥ 30 minutes on the local daily timeline (half-open [start, end)).'
+                                ),
+                            end: zod
+                                .string()
+                                .describe(
+                                    'End time HH:MM (24-hour). Exclusive (half-open interval). Each window must span ≥ 30 minutes locally.'
+                                ),
+                        })
+                    )
+                    .describe(
+                        'Blocked local time windows when the alert must not run. Overlapping or identical windows are merged when saved. At most five windows before normalization; empty array clears quiet hours.'
+                    ),
+            }),
+            zod.null(),
+        ])
         .optional()
         .describe(
             'Blocked local time windows when the alert must not notify. Times use the project timezone. Null disables quiet hours.'
@@ -545,7 +567,7 @@ export const VisionAlertsUpdateBody = /* @__PURE__ */ zod.object({
             verdict: zod
                 .array(zod.string())
                 .optional()
-                .describe("Monitor verdicts to match, e.g. ['fail']. Requires succeeded-only statuses."),
+                .describe("Monitor verdicts to match, e.g. ['yes']. Requires succeeded-only statuses."),
             tags: zod
                 .array(zod.string())
                 .optional()
@@ -616,7 +638,29 @@ export const VisionAlertsUpdateBody = /* @__PURE__ */ zod.object({
         .default(visionAlertsUpdateBodyCooldownMinutesDefault)
         .describe('Metric alerts only: minimum minutes between repeated notifications. 0 means no cooldown.'),
     schedule_restriction: zod
-        .unknown()
+        .union([
+            zod.object({
+                blocked_windows: zod
+                    .array(
+                        zod.object({
+                            start: zod
+                                .string()
+                                .describe(
+                                    'Start time HH:MM (24-hour, project timezone). Inclusive. Each window must span ≥ 30 minutes on the local daily timeline (half-open [start, end)).'
+                                ),
+                            end: zod
+                                .string()
+                                .describe(
+                                    'End time HH:MM (24-hour). Exclusive (half-open interval). Each window must span ≥ 30 minutes locally.'
+                                ),
+                        })
+                    )
+                    .describe(
+                        'Blocked local time windows when the alert must not run. Overlapping or identical windows are merged when saved. At most five windows before normalization; empty array clears quiet hours.'
+                    ),
+            }),
+            zod.null(),
+        ])
         .optional()
         .describe(
             'Blocked local time windows when the alert must not notify. Times use the project timezone. Null disables quiet hours.'
@@ -671,7 +715,7 @@ export const VisionAlertsPartialUpdateBody = /* @__PURE__ */ zod.object({
             verdict: zod
                 .array(zod.string())
                 .optional()
-                .describe("Monitor verdicts to match, e.g. ['fail']. Requires succeeded-only statuses."),
+                .describe("Monitor verdicts to match, e.g. ['yes']. Requires succeeded-only statuses."),
             tags: zod
                 .array(zod.string())
                 .optional()
@@ -742,7 +786,29 @@ export const VisionAlertsPartialUpdateBody = /* @__PURE__ */ zod.object({
         .default(visionAlertsPartialUpdateBodyCooldownMinutesDefault)
         .describe('Metric alerts only: minimum minutes between repeated notifications. 0 means no cooldown.'),
     schedule_restriction: zod
-        .unknown()
+        .union([
+            zod.object({
+                blocked_windows: zod
+                    .array(
+                        zod.object({
+                            start: zod
+                                .string()
+                                .describe(
+                                    'Start time HH:MM (24-hour, project timezone). Inclusive. Each window must span ≥ 30 minutes on the local daily timeline (half-open [start, end)).'
+                                ),
+                            end: zod
+                                .string()
+                                .describe(
+                                    'End time HH:MM (24-hour). Exclusive (half-open interval). Each window must span ≥ 30 minutes locally.'
+                                ),
+                        })
+                    )
+                    .describe(
+                        'Blocked local time windows when the alert must not run. Overlapping or identical windows are merged when saved. At most five windows before normalization; empty array clears quiet hours.'
+                    ),
+            }),
+            zod.null(),
+        ])
         .optional()
         .describe(
             'Blocked local time windows when the alert must not notify. Times use the project timezone. Null disables quiet hours.'
