@@ -29,6 +29,7 @@ from products.replay_vision.backend.temporal.types import (
     MarkObservationRunningInputs,
     MarkObservationSucceededInputs,
 )
+from products.replay_vision.backend.temporal.vision_alerts.match_hook import record_alert_matches_guarded
 
 logger = structlog.get_logger(__name__)
 
@@ -69,16 +70,21 @@ def mark_observation_terminal(
     count_kind: Callable[[str], None],
 ) -> bool:
     """Flip pending/running → `status` and record metrics/logs; idempotent no-op against already-terminal rows."""
-    updated = ReplayObservation.objects.filter(
-        pk=observation_id,
-        status__in=[ObservationStatus.PENDING, ObservationStatus.RUNNING],
-    ).update(
-        status=status,
-        error_reason=error_reason,
-        completed_at=timezone.now(),
-    )
-    if not updated:
-        return False  # No state transition — retry against an already-terminal row.
+    # The transaction makes the outbox insert atomic with the status flip; the
+    # conditional UPDATE stays the exactly-once guard for both.
+    with transaction.atomic():
+        updated = ReplayObservation.objects.filter(
+            pk=observation_id,
+            status__in=[ObservationStatus.PENDING, ObservationStatus.RUNNING],
+        ).update(
+            status=status,
+            error_reason=error_reason,
+            completed_at=timezone.now(),
+        )
+        if not updated:
+            return False  # No state transition — retry against an already-terminal row.
+        if status == ObservationStatus.FAILED:
+            record_alert_matches_guarded(observation_id=observation_id, status=status.value)
     kind = _kind_from_error_reason(error_reason, valid_kinds)
     record_observation(status.value, scanner_type)
     count_kind(kind)
@@ -158,6 +164,7 @@ def mark_observation_succeeded_activity(inputs: MarkObservationSucceededInputs) 
                 "credits": credits,
             },
         )
+        record_alert_matches_guarded(observation_id=inputs.observation_id, status=ObservationStatus.SUCCEEDED.value)
     record_observation("succeeded", inputs.scanner_type)
     record_observation_e2e(inputs.scanner_type, (timezone.now() - obs["created_at"]).total_seconds())
     if receipt_created:

@@ -9,6 +9,7 @@ import dataclasses
 from datetime import UTC, datetime, timedelta
 from itertools import batched
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Avg, FloatField, QuerySet
@@ -29,6 +30,7 @@ from products.alerts.backend.destinations import (
     flush_alert_internal_events,
     produce_alert_internal_event,
 )
+from products.alerts.backend.scheduling import is_utc_datetime_blocked, parse_blocked_windows_tuples
 from products.replay_vision.backend.alert_state_machine import (
     AlertCheckOutcome,
     AlertState,
@@ -43,7 +45,7 @@ from products.replay_vision.backend.alert_utils import (
     due_alerts_q,
     next_allowed_check_at,
 )
-from products.replay_vision.backend.models.replay_observation import ObservationStatus, ReplayObservation
+from products.replay_vision.backend.models.replay_observation import ReplayObservation
 from products.replay_vision.backend.models.vision_alert import (
     DELIVERED_MATCH_RETENTION_DAYS,
     EVENT_RETENTION_DAYS,
@@ -54,11 +56,14 @@ from products.replay_vision.backend.models.vision_alert import (
     VisionAlertKind,
     VisionAlertMatch,
     VisionAlertMetric,
+    selection_statuses,
 )
+from products.replay_vision.backend.observation_formatting import describe_output
 from products.replay_vision.backend.temporal.decorators import track_activity
 from products.replay_vision.backend.temporal.vision_actions.synthesis import apply_observation_predicate
 from products.replay_vision.backend.temporal.vision_alerts.constants import (
     CLEANUP_BATCH_SIZE,
+    MATCH_SUMMARY_LINES,
     MAX_ALERTS_PER_BATCH,
     NOTIFICATION_FLUSH_TIMEOUT_SECONDS,
 )
@@ -197,10 +202,6 @@ def _evaluate_batch(inputs: EvaluateAlertBatchInput) -> EvaluateAlertBatchOutput
     return output
 
 
-def _selection_statuses(selection: dict[str, Any]) -> list[str]:
-    return list(selection.get("statuses") or [ObservationStatus.SUCCEEDED.value])
-
-
 def _observation_window_qs(
     alert: VisionAlertConfiguration, window_start: datetime, window_end: datetime
 ) -> QuerySet[ReplayObservation]:
@@ -208,7 +209,7 @@ def _observation_window_qs(
     queryset = ReplayObservation.objects.filter(
         team_id=alert.team_id,
         scanner_id=alert.scanner_id,
-        status__in=_selection_statuses(selection),
+        status__in=selection_statuses(selection),
         completed_at__gte=window_start,
         completed_at__lt=window_end,
     )
@@ -564,3 +565,140 @@ def _cleanup_history(inputs: CleanupAlertHistoryInput) -> int:
         deleted += VisionAlertMatch.all_teams.filter(id__in=match_ids).delete()[0]
 
     return deleted
+
+
+class DrainMatchesInput(BaseModel):
+    pass
+
+
+class DrainMatchesOutput(BaseModel):
+    alerts_notified: int = 0
+    matches_delivered: int = 0
+
+
+@temporalio.activity.defn
+@track_activity()
+async def drain_vision_alert_matches_activity(inputs: DrainMatchesInput) -> DrainMatchesOutput:
+    from posthog.sync import database_sync_to_async
+
+    return await database_sync_to_async(_drain_matches, thread_sensitive=False)(inputs)
+
+
+@frozen
+class _DrainedBundle:
+    alert: VisionAlertConfiguration
+    match_ids: list[Any]
+    matched_count: int
+    produce_result: ProduceResult | None
+
+
+def _drain_matches(inputs: DrainMatchesInput) -> DrainMatchesOutput:
+    """Bundle undelivered match rows into one notification per alert and stamp them
+    delivered only after the producer acks.
+
+    No alert-row locks are taken here: match alerts have no lifecycle state to mutate,
+    and holding one across produce/flush would stall the observation-completion hook's
+    FK inserts against the same alert row. Stamping targets the explicitly drained row
+    IDs, never `delivered_at IS NULL`, so rows inserted mid-drain wait for the next tick.
+    """
+    now = datetime.now(UTC)
+    pending_alert_ids = list(
+        VisionAlertMatch.all_teams.filter(delivered_at__isnull=True).values_list("alert_id", flat=True).distinct()
+    )
+    if not pending_alert_ids:
+        return DrainMatchesOutput()
+
+    alerts = (
+        VisionAlertConfiguration.all_teams.filter(id__in=pending_alert_ids, kind=VisionAlertKind.MATCH)
+        .select_related("team", "scanner")
+        .order_by("id")
+    )
+
+    bundles: list[_DrainedBundle] = []
+    for alert in alerts:
+        if not alert.enabled:
+            continue  # Cleanup reaps the rows; delivering for a disabled alert is wrong.
+        if alert.snooze_until is not None and alert.snooze_until > now:
+            continue  # Hold: matches accumulate and deliver as one bundle after the snooze.
+        try:
+            if is_utc_datetime_blocked(
+                now, alert.team.timezone, parse_blocked_windows_tuples(alert.schedule_restriction)
+            ):
+                continue  # Quiet hours: hold until the window ends.
+        except Exception as e:
+            logger.exception("vision_alert.drain_invalid_quiet_hours", alert_id=str(alert.id), error=str(e))
+            continue
+
+        rows = list(
+            VisionAlertMatch.all_teams.filter(alert_id=alert.id, delivered_at__isnull=True)
+            .order_by("created_at", "id")
+            .values_list("id", "observation_id")
+        )
+        if not rows:
+            continue
+        produce_result = _emit_match_event(alert, rows, now)
+        bundles.append(
+            _DrainedBundle(
+                alert=alert,
+                match_ids=[row_id for row_id, _ in rows],
+                matched_count=len(rows),
+                produce_result=produce_result,
+            )
+        )
+
+    if any(b.produce_result is not None for b in bundles):
+        flush_alert_internal_events(NOTIFICATION_FLUSH_TIMEOUT_SECONDS)
+
+    output = DrainMatchesOutput()
+    for bundle in bundles:
+        if bundle.produce_result is None:
+            continue  # Enqueue failed; rows stay undelivered and re-emit next tick.
+        if not alert_internal_event_delivered(
+            bundle.produce_result,
+            team_id=bundle.alert.team_id,
+            alert_id=str(bundle.alert.id),
+            event_name="$replay_vision_alert_match",
+        ):
+            continue
+        with transaction.atomic():
+            VisionAlertMatch.all_teams.filter(id__in=bundle.match_ids).update(delivered_at=now)
+        output.alerts_notified += 1
+        output.matches_delivered += bundle.matched_count
+    return output
+
+
+def _emit_match_event(
+    alert: VisionAlertConfiguration, rows: list[tuple[Any, Any]], now: datetime
+) -> ProduceResult | None:
+    observation_ids = [str(observation_id) for _, observation_id in rows]
+    summary_rows = ReplayObservation.objects.filter(id__in=observation_ids[:MATCH_SUMMARY_LINES]).values_list(
+        "id", "scanner_result", "completed_at"
+    )
+    by_id = {str(row_id): (scanner_result, completed_at) for row_id, scanner_result, completed_at in summary_rows}
+    lines: list[str] = []
+    for observation_id in observation_ids[:MATCH_SUMMARY_LINES]:
+        scanner_result, completed_at = by_id.get(observation_id, (None, None))
+        model_output = (scanner_result or {}).get("model_output") or {}
+        descriptor = describe_output(model_output) or "observation"
+        stamp = f"({completed_at:%Y-%m-%d %H:%M} UTC) " if completed_at else ""
+        lines.append(f"- {stamp}{descriptor}")
+    if len(observation_ids) > MATCH_SUMMARY_LINES:
+        lines.append(f"- and {len(observation_ids) - MATCH_SUMMARY_LINES} more")
+
+    # Deterministic uuid over the drained row set: an identical-batch retry (crash
+    # after ack, before the stamp, with no new rows) dedupes at ingestion.
+    event_uuid = uuid5(NAMESPACE_URL, f"vision-alert-match:{alert.id}:{','.join(sorted(str(m) for m, _ in rows))}")
+
+    properties = {
+        **_base_properties(alert, now),
+        "matched_count": len(rows),
+        "observation_ids": observation_ids,
+        "summary": "\n".join(lines),
+    }
+    return produce_alert_internal_event(
+        team_id=alert.team_id,
+        event_name="$replay_vision_alert_match",
+        properties=properties,
+        timestamp=now,
+        uuid=str(event_uuid),
+    )
