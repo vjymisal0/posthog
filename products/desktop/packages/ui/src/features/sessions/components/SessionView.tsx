@@ -251,6 +251,7 @@ export function SessionView({
     confirmModelSwitch,
     cancelModelSwitch,
   } = usePendingModelSwitch({
+    taskId,
     sessionModelOption,
     hasSessionEvents: events.length > 0,
     onApply: applyConfigOption,
