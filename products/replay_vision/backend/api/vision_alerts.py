@@ -522,12 +522,25 @@ class VisionAlertViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
             queryset = queryset.filter(scanner_id__in=accessible_scanners.values_list("id", flat=True))
         return queryset.filter(team_id=self.team_id).select_related("created_by", "scanner")
 
+    def safely_get_object(self, queryset: QuerySet) -> VisionAlertConfiguration:
+        alert = get_object_or_404(
+            queryset, **{self.lookup_field: self.kwargs[self.lookup_url_kwarg or self.lookup_field]}
+        )
+        self._check_scanner_access(alert)
+        return alert
+
+    def _check_scanner_access(self, alert: VisionAlertConfiguration) -> None:
+        # Object-level access rows live on the scanner, not the alert; the generic
+        # object check cannot see them, so check the scanner explicitly.
+        self.check_object_permissions(self.request, alert.scanner)
+
     def _get_locked_alert(self) -> VisionAlertConfiguration:
         # No select_related here: FOR UPDATE rejects the outer join a nullable created_by adds.
         queryset = VisionAlertConfiguration.objects.for_team(self.team_id).select_for_update()
         lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
         alert = get_object_or_404(queryset, **{self.lookup_field: self.kwargs[lookup_url_kwarg]})
         self.check_object_permissions(self.request, alert)
+        self._check_scanner_access(alert)
         return alert
 
     def update(self, request: Request, *args: object, **kwargs: Any) -> Response:
@@ -661,6 +674,14 @@ class VisionAlertViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
         report_user_action(request.user, "replay vision alert reset", {"alert_id": str(alert.id)}, request=request)
         serializer = self.get_serializer(alert)
         return Response(serializer.data)
+
+    def destroy(self, request: Request, *args: object, **kwargs: Any) -> Response:
+        # The lock serialises against create_destination, which would otherwise insert
+        # HogFunctions after the cleanup pass and orphan them.
+        with transaction.atomic():
+            instance = self._get_locked_alert()
+            self.perform_destroy(instance)
+        return Response(status=204)
 
     def perform_destroy(self, instance: VisionAlertConfiguration) -> None:
         soft_delete_all_alert_destinations(
