@@ -79,6 +79,7 @@ import {
 } from "@posthog/ui/features/settings/hooks/useOpenSettings";
 import { useSidebarStore } from "@posthog/ui/features/sidebar/sidebarStore";
 import { useTasks } from "@posthog/ui/features/tasks/useTasks";
+import { useSpendAnalysisEnabled } from "@posthog/ui/features/usage/useSpendAnalysisEnabled";
 import { useWorkspaces } from "@posthog/ui/features/workspace/useWorkspace";
 import { LoopIcon } from "@posthog/ui/primitives/LoopIcon";
 import {
@@ -218,6 +219,7 @@ export function CommandMenu({ open, onOpenChange }: CommandMenuProps) {
     import.meta.env.DEV,
   );
   const loopsEnabled = useFeatureFlag(LOOPS_FLAG, import.meta.env.DEV);
+  const spendAnalysisEnabled = useSpendAnalysisEnabled();
   const { channels } = useChannels({ enabled: bluebirdEnabled });
   const { theme, setTheme } = useThemeStore();
   const toggleLeftSidebar = useSidebarStore((state) => state.toggle);
@@ -402,14 +404,21 @@ export function CommandMenu({ open, onOpenChange }: CommandMenuProps) {
             },
           ]
         : []),
-      {
-        id: "cost-management",
-        label: "Cost management",
-        keywords: "cost spend limits budget savings recommendations",
-        icon: <Gauge size={12} className="text-gray-11" />,
-        action: "open-cost-management",
-        onRun: () => openSettingsDialog("cost-management"),
-      },
+      // Gated like every other cost-management entry point: without spend
+      // analysis the settings page is hidden and redirects to General, so the
+      // command would not do what its label says.
+      ...(spendAnalysisEnabled
+        ? [
+            {
+              id: "cost-management",
+              label: "Cost management",
+              keywords: "cost spend limits budget savings recommendations",
+              icon: <Gauge size={12} className="text-gray-11" />,
+              action: "open-cost-management" as CommandMenuAction,
+              onRun: () => openSettingsDialog("cost-management"),
+            },
+          ]
+        : []),
       {
         id: "plan-usage",
         label: "Plan & usage",
@@ -581,6 +590,7 @@ export function CommandMenu({ open, onOpenChange }: CommandMenuProps) {
     canSearchFiles,
     openFilePicker,
     loopsEnabled,
+    spendAnalysisEnabled,
   ]);
 
   const taskSections = useMemo<CommandSection[]>(() => {
