@@ -581,8 +581,6 @@ class DrainMatchesOutput(BaseModel):
 @temporalio.activity.defn
 @track_activity()
 async def drain_vision_alert_matches_activity(inputs: DrainMatchesInput) -> DrainMatchesOutput:
-    from posthog.sync import database_sync_to_async
-
     return await database_sync_to_async(_drain_matches, thread_sensitive=False)(inputs)
 
 
