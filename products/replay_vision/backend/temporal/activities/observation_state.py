@@ -164,7 +164,13 @@ def mark_observation_succeeded_activity(inputs: MarkObservationSucceededInputs) 
                 "credits": credits,
             },
         )
-        record_alert_matches_guarded(observation_id=inputs.observation_id, status=ObservationStatus.SUCCEEDED.value)
+        record_alert_matches_guarded(
+            observation_id=inputs.observation_id,
+            status=ObservationStatus.SUCCEEDED.value,
+            team_id=obs["team_id"],
+            scanner_id=obs["scanner_id"],
+            model_output=inputs.scanner_result.model_output.model_dump(mode="json"),
+        )
     record_observation("succeeded", inputs.scanner_type)
     record_observation_e2e(inputs.scanner_type, (timezone.now() - obs["created_at"]).total_seconds())
     if receipt_created:

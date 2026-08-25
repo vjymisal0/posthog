@@ -63,8 +63,10 @@ from products.replay_vision.backend.temporal.decorators import track_activity
 from products.replay_vision.backend.temporal.vision_actions.synthesis import apply_observation_predicate
 from products.replay_vision.backend.temporal.vision_alerts.constants import (
     CLEANUP_BATCH_SIZE,
+    MATCH_DESCRIPTOR_MAX_CHARS,
     MATCH_SUMMARY_LINES,
     MAX_ALERTS_PER_BATCH,
+    MAX_MATCHES_PER_BUNDLE,
     NOTIFICATION_FLUSH_TIMEOUT_SECONDS,
 )
 
@@ -588,7 +590,6 @@ async def drain_vision_alert_matches_activity(inputs: DrainMatchesInput) -> Drai
 class _DrainedBundle:
     alert: VisionAlertConfiguration
     match_ids: list[Any]
-    matched_count: int
     produce_result: ProduceResult | None
 
 
@@ -602,14 +603,18 @@ def _drain_matches(inputs: DrainMatchesInput) -> DrainMatchesOutput:
     IDs, never `delivered_at IS NULL`, so rows inserted mid-drain wait for the next tick.
     """
     now = datetime.now(UTC)
-    pending_alert_ids = list(
-        VisionAlertMatch.all_teams.filter(delivered_at__isnull=True).values_list("alert_id", flat=True).distinct()
-    )
-    if not pending_alert_ids:
+    pending_rows: dict[Any, list[tuple[Any, Any]]] = {}
+    for alert_id, row_id, observation_id in (
+        VisionAlertMatch.all_teams.filter(delivered_at__isnull=True)
+        .order_by("created_at", "id")
+        .values_list("alert_id", "id", "observation_id")
+    ):
+        pending_rows.setdefault(alert_id, []).append((row_id, observation_id))
+    if not pending_rows:
         return DrainMatchesOutput()
 
     alerts = (
-        VisionAlertConfiguration.all_teams.filter(id__in=pending_alert_ids, kind=VisionAlertKind.MATCH)
+        VisionAlertConfiguration.all_teams.filter(id__in=pending_rows.keys(), kind=VisionAlertKind.MATCH)
         .select_related("team", "scanner")
         .order_by("id")
     )
@@ -629,11 +634,9 @@ def _drain_matches(inputs: DrainMatchesInput) -> DrainMatchesOutput:
             logger.exception("vision_alert.drain_invalid_quiet_hours", alert_id=str(alert.id), error=str(e))
             continue
 
-        rows = list(
-            VisionAlertMatch.all_teams.filter(alert_id=alert.id, delivered_at__isnull=True)
-            .order_by("created_at", "id")
-            .values_list("id", "observation_id")
-        )
+        # A huge backlog splits across ticks: an oversized event payload would fail the
+        # produce forever, and the leftovers keep their created_at order.
+        rows = pending_rows.get(alert.id, [])[:MAX_MATCHES_PER_BUNDLE]
         if not rows:
             continue
         produce_result = _emit_match_event(alert, rows, now)
@@ -641,7 +644,6 @@ def _drain_matches(inputs: DrainMatchesInput) -> DrainMatchesOutput:
             _DrainedBundle(
                 alert=alert,
                 match_ids=[row_id for row_id, _ in rows],
-                matched_count=len(rows),
                 produce_result=produce_result,
             )
         )
@@ -660,11 +662,16 @@ def _drain_matches(inputs: DrainMatchesInput) -> DrainMatchesOutput:
             event_name="$replay_vision_alert_match",
         ):
             continue
-        with transaction.atomic():
-            VisionAlertMatch.all_teams.filter(id__in=bundle.match_ids).update(delivered_at=now)
+        VisionAlertMatch.all_teams.filter(id__in=bundle.match_ids).update(delivered_at=now)
         output.alerts_notified += 1
-        output.matches_delivered += bundle.matched_count
+        output.matches_delivered += len(bundle.match_ids)
     return output
+
+
+def _escape_mrkdwn(text: str) -> str:
+    """Classifier tags and labels are model output derived from replayed pages; escaping
+    the mrkdwn control characters keeps them from becoming links or formatting in Slack."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _emit_match_event(
@@ -679,7 +686,7 @@ def _emit_match_event(
     for observation_id in observation_ids[:MATCH_SUMMARY_LINES]:
         scanner_result, completed_at = by_id.get(observation_id, (None, None))
         model_output = (scanner_result or {}).get("model_output") or {}
-        descriptor = describe_output(model_output) or "observation"
+        descriptor = _escape_mrkdwn((describe_output(model_output) or "observation")[:MATCH_DESCRIPTOR_MAX_CHARS])
         stamp = f"({completed_at:%Y-%m-%d %H:%M} UTC) " if completed_at else ""
         lines.append(f"- {stamp}{descriptor}")
     if len(observation_ids) > MATCH_SUMMARY_LINES:
@@ -692,7 +699,7 @@ def _emit_match_event(
     properties = {
         **_base_properties(alert, now),
         "matched_count": len(rows),
-        "observation_ids": observation_ids,
+        "observation_ids": observation_ids[:MATCH_SUMMARY_LINES],
         "summary": "\n".join(lines),
     }
     return produce_alert_internal_event(

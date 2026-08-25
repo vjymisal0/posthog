@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from django.utils import timezone
 
+from parameterized import parameterized
+
 from posthog.models.utils import uuid7
 
 from products.replay_vision.backend.models.replay_observation import (
@@ -38,6 +40,7 @@ from products.replay_vision.backend.temporal.vision_alerts.activities import (
     _drain_matches,
 )
 from products.replay_vision.backend.temporal.vision_alerts.constants import MATCH_SUMMARY_LINES
+from products.replay_vision.backend.temporal.vision_alerts.match_hook import selection_matches
 from products.replay_vision.backend.tests.helpers import snapshot_for
 
 _ACTIVITIES = "products.replay_vision.backend.temporal.vision_alerts.activities"
@@ -229,6 +232,19 @@ class TestVisionAlertMatchOutbox(BaseTest):
         props = produce.call_args.kwargs["properties"]
         assert f"and 2 more" in props["summary"]
         assert not VisionAlertMatch.all_teams.filter(alert_id=alert.id, delivered_at__isnull=True).exists()
+
+    @parameterized.expand(
+        [
+            ("min_score_zero_matches_zero", {"min_score": 0}, {"score": 0.0}, True),
+            ("min_score_zero_needs_a_score", {"min_score": 0}, {}, False),
+            ("max_score_excludes_above", {"max_score": 2}, {"score": 2.5}, False),
+            ("legacy_single_verdict_string", {"verdict": "yes"}, {"verdict": "yes"}, True),
+            ("verdict_list_excludes_other", {"verdict": ["no"]}, {"verdict": "yes"}, False),
+            ("freeform_tag_counts", {"tags": ["checkout"]}, {"tags_freeform": ["checkout"]}, True),
+        ]
+    )
+    def test_selection_matches_semantics(self, _name: str, selection: dict, model_output: dict, expected: bool) -> None:
+        assert selection_matches(model_output, selection) is expected
 
     def test_cleanup_reaps_delivered_and_stale_rows(self) -> None:
         self._make_match_alert(selection={})
