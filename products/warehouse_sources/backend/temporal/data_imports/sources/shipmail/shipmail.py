@@ -16,6 +16,7 @@ from products.warehouse_sources.backend.temporal.data_imports.sources.common.typ
 from products.warehouse_sources.backend.temporal.data_imports.sources.shipmail.settings import SHIPMAIL_ENDPOINTS
 
 SHIPMAIL_BASE_URL = "https://shipmail.to/api/v1"
+REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 @frozen
@@ -66,6 +67,7 @@ def shipmail_source(
             "base_url": SHIPMAIL_BASE_URL,
             "headers": {"Accept": "application/json"},
             "auth": {"type": "bearer", "token": api_key},
+            "request_timeout": REQUEST_TIMEOUT_SECONDS,
             "paginator": JSONResponseCursorPaginator(
                 cursor_path="pagination.next_cursor",
                 cursor_param="cursor",
