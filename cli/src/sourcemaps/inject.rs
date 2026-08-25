@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use serde_json::{Map, Value};
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use walkdir::DirEntry;
@@ -67,6 +69,9 @@ pub fn inject_impl(
 
     info!("injecting selection: {}", file_selection);
 
+    // Resolve stdin once. We also need the concrete roots after injection to find and repair
+    // Angular service-worker manifests that track the rewritten chunks.
+    let file_selection = file_selection.clone().resolve_stdin()?;
     let iterator = FileSelection::try_from(file_selection.clone())?;
 
     let mut pairs = read_pairs(
@@ -108,13 +113,20 @@ pub fn inject_impl(
         }
     }
 
-    // Write the source and sourcemaps back to disk
+    let rewritten = rewritten_source_paths(&pairs, &source_hashes_before);
+
+    // Write the source and sourcemaps back to disk.
     for pair in &pairs {
         pair.save()?;
     }
-    info!("injecting done");
 
-    warn_about_rewritten_files(&pairs, &source_hashes_before);
+    // Angular generates ngsw.json before this command runs. Keep its SHA-1 entries in sync with
+    // the chunks we just changed so existing clients accept the new application version.
+    let repaired_manifests =
+        update_angular_service_worker_manifests(&file_selection.directory, &rewritten)?;
+
+    info!("injecting done");
+    warn_about_rewritten_files(&rewritten, &repaired_manifests);
     Ok(())
 }
 
@@ -138,18 +150,27 @@ fn source_content_hashes(pairs: &[SourcePair]) -> HashMap<PathBuf, String> {
 /// Subresource Integrity attribute, a deploy manifest — no longer matches the bytes on disk, which
 /// breaks the deploy with no other signal. Report only the chunks whose content actually changed, so
 /// re-runs over an already injected build stay quiet.
-fn warn_about_rewritten_files(pairs: &[SourcePair], hashes_before: &HashMap<PathBuf, String>) {
-    let rewritten = rewritten_source_paths(pairs, hashes_before);
+fn warn_about_rewritten_files(rewritten: &[PathBuf], repaired_manifests: &[PathBuf]) {
     if rewritten.is_empty() {
         return;
     }
 
-    warn!(
-        "injection rewrote {} built file(s) in place. Any asset hash computed before this step \
-         (service worker manifest, Subresource Integrity attribute, deploy manifest) no longer \
-         matches and must be regenerated after injecting:",
-        rewritten.len()
-    );
+    if repaired_manifests.is_empty() {
+        warn!(
+            "injection rewrote {} built file(s) in place. Any asset hash computed before this step \
+             (service worker manifest, Subresource Integrity attribute, deploy manifest) no longer \
+             matches and must be regenerated after injecting:",
+            rewritten.len()
+        );
+    } else {
+        warn!(
+            "injection rewrote {} built file(s) in place and updated {} Angular service-worker \
+             manifest(s). Any other asset hash computed before this step (Subresource Integrity \
+             attribute, deploy manifest) must still be regenerated:",
+            rewritten.len(),
+            repaired_manifests.len()
+        );
+    }
     for path in rewritten {
         warn!("  rewrote {}", path.display());
     }
@@ -157,10 +178,10 @@ fn warn_about_rewritten_files(pairs: &[SourcePair], hashes_before: &HashMap<Path
 
 /// Return the source paths whose content differs from `hashes_before`, so a re-run over an already
 /// injected build reports nothing.
-fn rewritten_source_paths<'a>(
-    pairs: &'a [SourcePair],
+fn rewritten_source_paths(
+    pairs: &[SourcePair],
     hashes_before: &HashMap<PathBuf, String>,
-) -> Vec<&'a PathBuf> {
+) -> Vec<PathBuf> {
     pairs
         .iter()
         .filter(|pair| {
@@ -170,8 +191,145 @@ fn rewritten_source_paths<'a>(
                 .map(String::as_str)
                 != Some(&hash_now)
         })
-        .map(|pair| &pair.source.inner.path)
+        .map(|pair| pair.source.inner.path.clone())
         .collect()
+}
+
+/// Update matching SHA-1 entries in Angular's generated `ngsw.json` manifests.
+///
+/// Angular writes the manifest as part of `ng build`, before sourcemap injection can run. Without
+/// this repair, its service worker rejects every injected chunk because the bytes no longer match
+/// the recorded hash, then leaves existing clients on the previous application version.
+pub(crate) fn update_angular_service_worker_manifests(
+    selection_roots: &[PathBuf],
+    rewritten: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    if rewritten.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let manifests = find_angular_service_worker_manifests(selection_roots);
+    let mut repaired = Vec::new();
+
+    for manifest_path in manifests {
+        let bytes = std::fs::read(&manifest_path)
+            .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+        let mut manifest: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        let hash_table = manifest
+            .get_mut("hashTable")
+            .and_then(Value::as_object_mut)
+            .with_context(|| format!("{} has no hashTable object", manifest_path.display()))?;
+        let manifest_root = manifest_path
+            .parent()
+            .expect("ngsw.json always has a parent directory")
+            .canonicalize()
+            .with_context(|| {
+                format!(
+                    "Failed to resolve Angular build directory {}",
+                    manifest_path.display()
+                )
+            })?;
+
+        let updated = update_manifest_hash_table(hash_table, &manifest_root, rewritten)?;
+        if updated == 0 {
+            continue;
+        }
+
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)
+            .with_context(|| format!("Failed to update {}", manifest_path.display()))?;
+        info!(
+            "updated {updated} asset hash(es) in Angular service-worker manifest {}",
+            manifest_path.display()
+        );
+        repaired.push(manifest_path);
+    }
+
+    Ok(repaired)
+}
+
+fn find_angular_service_worker_manifests(selection_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut manifests = HashSet::new();
+    for root in selection_roots {
+        let scan_root = if root.is_dir() {
+            root.as_path()
+        } else {
+            root.parent().unwrap_or(root.as_path())
+        };
+        for entry in walkdir::WalkDir::new(scan_root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
+            if entry.file_type().is_file() && entry.file_name() == "ngsw.json" {
+                manifests.insert(entry.into_path());
+            }
+        }
+    }
+    manifests.into_iter().collect()
+}
+
+fn update_manifest_hash_table(
+    hash_table: &mut Map<String, Value>,
+    manifest_root: &Path,
+    rewritten: &[PathBuf],
+) -> Result<usize> {
+    let mut updated = 0;
+
+    for source_path in rewritten {
+        let canonical_source = source_path.canonicalize().with_context(|| {
+            format!("Failed to resolve rewritten file {}", source_path.display())
+        })?;
+        let Ok(relative_path) = canonical_source.strip_prefix(manifest_root) else {
+            continue;
+        };
+        let relative_url = relative_path.to_string_lossy().replace('\\', "/");
+        let Some(key) = manifest_key_for_relative_path(hash_table, &relative_url)? else {
+            continue;
+        };
+        let digest = sha1_hex(&std::fs::read(&canonical_source).with_context(|| {
+            format!(
+                "Failed to hash rewritten file {}",
+                canonical_source.display()
+            )
+        })?);
+        hash_table.insert(key, Value::String(digest));
+        updated += 1;
+    }
+
+    Ok(updated)
+}
+
+fn manifest_key_for_relative_path(
+    hash_table: &Map<String, Value>,
+    relative_url: &str,
+) -> Result<Option<String>> {
+    let exact_key = format!("/{relative_url}");
+    if hash_table.contains_key(&exact_key) {
+        return Ok(Some(exact_key));
+    }
+
+    // A non-root Angular base href prefixes every manifest URL (for example,
+    // `/my-app/main.js`). The generated manifest does not record that prefix separately, so use
+    // a unique path-suffix match. Refuse ambiguous matches instead of changing the wrong asset.
+    let suffix = format!("/{relative_url}");
+    let matches = hash_table
+        .keys()
+        .filter(|key| urlencoding::decode(key).is_ok_and(|decoded| decoded.ends_with(&suffix)))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [] => Ok(None),
+        [key] => Ok(Some(key.clone())),
+        _ => bail!(
+            "Angular service-worker manifest has multiple entries matching {relative_url}: {}",
+            matches.join(", ")
+        ),
+    }
+}
+
+fn sha1_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha1::digest(bytes))
 }
 
 /// Event-mode injection (`--release-mode=event`): content-addressed chunk ids plus an optional
@@ -494,6 +652,75 @@ mod tests {
         let before_rerun = source_content_hashes(&injected);
         let reinjected = inject_pairs(injected, None).expect("failed to re-inject pairs");
         assert!(rewritten_source_paths(&reinjected, &before_rerun).is_empty());
+    }
+
+    #[test]
+    fn angular_service_worker_hashes_follow_rewritten_chunks() {
+        let dir = tempfile::tempdir().expect("failed to create temporary directory");
+        let chunks = dir.path().join("chunks");
+        fs::create_dir(&chunks).expect("failed to create chunks directory");
+        let app = dir.path().join("app.js");
+        let lazy = chunks.join("lazy chunk.js");
+        fs::write(&app, "injected app").expect("failed to write app chunk");
+        fs::write(&lazy, "injected lazy chunk").expect("failed to write lazy chunk");
+        fs::write(
+            dir.path().join("ngsw.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "configVersion": 1,
+                "hashTable": {
+                    "/base/app.js": "old-app-hash",
+                    "/base/chunks/lazy%20chunk.js": "old-lazy-hash",
+                    "/base/unchanged.js": "unchanged-hash"
+                }
+            }))
+            .expect("failed to serialize manifest"),
+        )
+        .expect("failed to write manifest");
+
+        let repaired = update_angular_service_worker_manifests(
+            &[dir.path().to_path_buf()],
+            &[app.clone(), lazy.clone()],
+        )
+        .expect("failed to repair Angular manifest");
+
+        assert_eq!(repaired, vec![dir.path().join("ngsw.json")]);
+        let manifest: Value = serde_json::from_slice(
+            &fs::read(dir.path().join("ngsw.json")).expect("failed to read repaired manifest"),
+        )
+        .expect("failed to parse repaired manifest");
+        let hash_table = manifest["hashTable"]
+            .as_object()
+            .expect("manifest hashTable");
+        assert_eq!(
+            hash_table["/base/app.js"],
+            Value::String(sha1_hex(b"injected app"))
+        );
+        assert_eq!(
+            hash_table["/base/chunks/lazy%20chunk.js"],
+            Value::String(sha1_hex(b"injected lazy chunk"))
+        );
+        assert_eq!(hash_table["/base/unchanged.js"], "unchanged-hash");
+    }
+
+    #[test]
+    fn angular_service_worker_hash_repair_refuses_ambiguous_base_paths() {
+        let mut hash_table = serde_json::from_value::<Map<String, Value>>(serde_json::json!({
+            "/one/app.js": "one",
+            "/two/app.js": "two"
+        }))
+        .expect("failed to create hash table");
+
+        let error = manifest_key_for_relative_path(&hash_table, "app.js")
+            .expect_err("ambiguous paths must not update the wrong asset");
+
+        assert!(error.to_string().contains("multiple entries"));
+        hash_table.insert("/app.js".to_string(), Value::String("exact".to_string()));
+        assert_eq!(
+            manifest_key_for_relative_path(&hash_table, "app.js")
+                .expect("exact path should win")
+                .as_deref(),
+            Some("/app.js")
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::{
             FileSelectionArgs, ReleaseArgs, ReleaseMode, UploadConcurrencyArgs, UploadConflictArgs,
         },
         content::MinifiedSourceFile,
-        inject::get_release_for_maps,
+        inject::{get_release_for_maps, update_angular_service_worker_manifests},
         plain::inject::{is_javascript_file, is_stylesheet_file},
         source_pairs::{read_pairs, SourcePair},
     },
@@ -205,7 +205,8 @@ pub fn upload(args: &Args, existing_release: Option<&Release>) -> Result<()> {
     upload_result?;
 
     if args.delete_after {
-        let cleanup_roots = canonical_selection_roots(&file_selection.directory);
+        let manifest_roots = file_selection.directory.clone();
+        let cleanup_roots = canonical_selection_roots(&manifest_roots);
         let stylesheet_selection = FileSelection::try_from(file_selection)?;
         let stylesheet_pairs = read_pairs(
             stylesheet_selection.into_iter().filter(is_stylesheet_file),
@@ -237,12 +238,25 @@ pub fn upload(args: &Args, existing_release: Option<&Release>) -> Result<()> {
         )
         .context("While stripping sourcemap references")?;
         if !rewritten.is_empty() {
-            warn!(
-                "cleanup stripped sourceMappingURL comments from {} built file(s) in place. Any \
-                 asset hash computed before this step (service worker manifest, Subresource \
-                 Integrity attribute, deploy manifest) no longer matches and must be regenerated:",
-                rewritten.len()
-            );
+            let repaired_manifests =
+                update_angular_service_worker_manifests(&manifest_roots, &rewritten)?;
+            if repaired_manifests.is_empty() {
+                warn!(
+                    "cleanup stripped sourceMappingURL comments from {} built file(s) in place. Any \
+                     asset hash computed before this step (service worker manifest, Subresource \
+                     Integrity attribute, deploy manifest) no longer matches and must be regenerated:",
+                    rewritten.len()
+                );
+            } else {
+                warn!(
+                    "cleanup stripped sourceMappingURL comments from {} built file(s) in place and \
+                     updated {} Angular service-worker manifest(s). Any other asset hash computed \
+                     before this step (Subresource Integrity attribute, deploy manifest) must still \
+                     be regenerated:",
+                    rewritten.len(),
+                    repaired_manifests.len()
+                );
+            }
             for path in &rewritten {
                 warn!("  rewrote {}", path.display());
             }
