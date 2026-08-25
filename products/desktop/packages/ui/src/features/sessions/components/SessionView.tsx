@@ -295,6 +295,7 @@ export function SessionView({
     (session) => session?.isCompacting ?? false,
   );
   useAutoCompact({
+    sessionKey: sessionId,
     usage: contextUsage,
     isCompacting,
     isRunning,
