@@ -95949,6 +95949,10 @@ export namespace Schemas {
      * The initial index from which to return the results.
      */
     offset?: number;
+    /**
+     * Only return alerts on this scanner.
+     */
+    scanner_id?: string;
     };
 
     export type VisionAlertsEventsListParams = {
