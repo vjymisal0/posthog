@@ -3,7 +3,7 @@ import inspect
 import pytest
 from unittest.mock import patch
 
-from django.db import InterfaceError, OperationalError
+from django.db import InterfaceError, InternalError, OperationalError
 
 from posthog.temporal.common.utils import (
     close_db_connections,
@@ -201,7 +201,15 @@ CLOSE_DB_CONNECTIONS_TARGET = "posthog.temporal.common.utils._close_db_connectio
 
 
 @pytest.mark.parametrize(
-    "error", [OperationalError("the connection is closed"), InterfaceError("connection already closed")]
+    "error",
+    [
+        OperationalError("the connection is closed"),
+        InterfaceError("connection already closed"),
+        # psycopg (v3) maps SQLSTATE 25006 to its own InternalError rather than OperationalError, so
+        # Django wraps a write that lands on a since-demoted primary as django.db.InternalError — a
+        # stale connection is the same class of blip this helper already retries once.
+        InternalError("cannot execute UPDATE in a read-only transaction"),
+    ],
 )
 def test_retry_on_db_connection_drop_retries_once_then_succeeds(error):
     calls = 0
@@ -221,7 +229,12 @@ def test_retry_on_db_connection_drop_retries_once_then_succeeds(error):
 
 
 @pytest.mark.parametrize(
-    "error", [OperationalError("the connection is closed"), InterfaceError("connection already closed")]
+    "error",
+    [
+        OperationalError("the connection is closed"),
+        InterfaceError("connection already closed"),
+        InternalError("cannot execute UPDATE in a read-only transaction"),
+    ],
 )
 def test_retry_on_db_connection_drop_raises_after_second_failure(error):
     calls = 0
@@ -246,6 +259,20 @@ def test_retry_on_db_connection_drop_does_not_retry_unrelated_errors():
         raise ValueError("not a connection error")
 
     with pytest.raises(ValueError):
+        retry_on_db_connection_drop(operation)
+
+    assert calls == 1
+
+
+def test_retry_on_db_connection_drop_does_not_retry_unrelated_internal_error():
+    calls = 0
+
+    def operation():
+        nonlocal calls
+        calls += 1
+        raise InternalError("some other internal error")
+
+    with pytest.raises(InternalError):
         retry_on_db_connection_drop(operation)
 
     assert calls == 1
