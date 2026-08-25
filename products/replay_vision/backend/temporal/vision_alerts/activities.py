@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from posthog.dataclasses import frozen
 from posthog.exceptions_capture import capture_exception
+from posthog.sync import database_sync_to_async
 
 from products.alerts.backend.destinations import (
     ProduceResult,
@@ -143,8 +144,6 @@ class _DispatchedAlert:
 @temporalio.activity.defn
 @track_activity()
 async def discover_due_vision_alerts_activity(inputs: DiscoverDueAlertsInput) -> DiscoverDueAlertsOutput:
-    from posthog.sync import database_sync_to_async
-
     return await database_sync_to_async(_discover_due, thread_sensitive=False)(inputs)
 
 
@@ -165,8 +164,6 @@ def _discover_due(inputs: DiscoverDueAlertsInput) -> DiscoverDueAlertsOutput:
 @temporalio.activity.defn
 @track_activity()
 async def evaluate_vision_alert_batch_activity(inputs: EvaluateAlertBatchInput) -> EvaluateAlertBatchOutput:
-    from posthog.sync import database_sync_to_async
-
     return await database_sync_to_async(_evaluate_batch, thread_sensitive=False)(inputs)
 
 
@@ -534,8 +531,6 @@ def _emit_failure_event(
 @temporalio.activity.defn
 @track_activity()
 async def cleanup_vision_alert_history_activity(inputs: CleanupAlertHistoryInput) -> int:
-    from posthog.sync import database_sync_to_async
-
     return await database_sync_to_async(_cleanup_history, thread_sensitive=False)(inputs)
 
 
